@@ -32,8 +32,13 @@ MAX_CAPACITY = 1 << 30
 MAX_ACTIVE_BUILDS = 64
 MAX_BUILD_TAGS = 24
 MAX_BLOB_SIZE = 1 << 20
+MAX_WORKFLOW_ACTIONS = 64
+MAX_WORKFLOW_TARGETS = 24
+MAX_WORKFLOW_CANDIDATES = 18
+MAX_WORKFLOW_BUDGET = 24 << 20
 TRANSFER_CHUNK = 1 << 16
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+_ACTION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,48}\Z")
 
 
 class CorruptBlob(Exception):
@@ -104,6 +109,133 @@ def _validate_needed(needed, known):
             raise ValueError(
                 "every needed digest must occur in the manifest")
     return needed
+
+
+def _validate_workflow(actions, targets, byte_budget):
+    """Validate a workflow declaration and return its indexed graph.
+
+    Validation covers every declared action, including actions unreachable
+    from *targets*.  The graph is also checked for dependency cycles here,
+    before any database checkout is created.
+    """
+    if isinstance(byte_budget, bool) \
+            or not isinstance(byte_budget, int) \
+            or not 0 <= byte_budget <= MAX_WORKFLOW_BUDGET:
+        raise ValueError(
+            "byte_budget must be an integer between 0 and 24 MiB")
+
+    if not isinstance(actions, dict) \
+            or not 1 <= len(actions) <= MAX_WORKFLOW_ACTIONS:
+        raise ValueError(
+            "actions must be a dict of 1 to %d actions"
+            % MAX_WORKFLOW_ACTIONS)
+
+    for action_id in actions:
+        if not isinstance(action_id, str) \
+                or _ACTION_ID_RE.match(action_id) is None:
+            raise ValueError(
+                "action IDs must be 1-48 ASCII letters, digits, '_' or '-'")
+
+    ids = sorted(actions)
+    index = {action_id: i for i, action_id in enumerate(ids)}
+    works = []
+    dep_masks = []
+    candidates = {}
+    candidate_count = 0
+
+    for action_id in ids:
+        declaration = actions[action_id]
+        if not isinstance(declaration, tuple) or len(declaration) != 4:
+            raise ValueError(
+                "action %r must be (work, deps, tag, digest)" % action_id)
+        work, deps, tag, digest = declaration
+
+        if isinstance(work, bool) or not isinstance(work, int) \
+                or not 1 <= work <= 1_000_000:
+            raise ValueError(
+                "work for %r must be an integer from 1 to 1,000,000"
+                % action_id)
+        works.append(work)
+
+        if not isinstance(deps, tuple):
+            raise ValueError("deps for %r must be a tuple" % action_id)
+        dep_mask = 0
+        seen_deps = set()
+        for dep in deps:
+            if not isinstance(dep, str) \
+                    or _ACTION_ID_RE.match(dep) is None \
+                    or dep not in index:
+                raise ValueError(
+                    "dependency %r of %r must be a declared action ID"
+                    % (dep, action_id))
+            if dep in seen_deps:
+                raise ValueError(
+                    "dependencies of %r must be distinct" % action_id)
+            seen_deps.add(dep)
+            dep_mask |= 1 << index[dep]
+        dep_masks.append(dep_mask)
+
+        has_candidate = tag is not None or digest is not None
+        if has_candidate:
+            candidate_count += 1
+            if candidate_count > MAX_WORKFLOW_CANDIDATES:
+                raise ValueError(
+                    "at most %d actions may have cache candidates"
+                    % MAX_WORKFLOW_CANDIDATES)
+            if tag is None or digest is None \
+                    or not _valid_tag(tag) \
+                    or not isinstance(digest, str) \
+                    or _DIGEST_RE.match(digest) is None:
+                raise ValueError(
+                    "cache candidate for %r must be a valid tag and "
+                    "64-character lowercase hex digest" % action_id)
+            candidates[index[action_id]] = (tag, digest)
+
+    if not isinstance(targets, list) \
+            or not 1 <= len(targets) <= MAX_WORKFLOW_TARGETS:
+        raise ValueError(
+            "targets must be a list of 1 to %d action IDs"
+            % MAX_WORKFLOW_TARGETS)
+    target_mask = 0
+    seen_targets = set()
+    for target in targets:
+        if not isinstance(target, str) or target not in index:
+            raise ValueError("every target must be a declared action ID")
+        if target in seen_targets:
+            raise ValueError("targets must be distinct")
+        seen_targets.add(target)
+        target_mask |= 1 << index[target]
+
+    # Reject cycles anywhere in the declaration, not only in target-reachable
+    # nodes.  Iterative-ish DFS with an explicit color array is sufficient at
+    # the declared maximum of 64 actions.
+    color = [0] * len(ids)
+
+    def visit(node):
+        if color[node] == 1:
+            raise ValueError("workflow dependencies must not contain a cycle")
+        if color[node] == 2:
+            return
+        color[node] = 1
+        deps = dep_masks[node]
+        while deps:
+            bit = deps & -deps
+            deps ^= bit
+            visit(bit.bit_length() - 1)
+        color[node] = 2
+
+    for node in range(len(ids)):
+        visit(node)
+
+    return {
+        "ids": ids,
+        "index": index,
+        "works": works,
+        "dep_masks": dep_masks,
+        "candidates": candidates,
+        "target_mask": target_mask,
+        "byte_budget": byte_budget,
+    }
 
 
 def _rmtree(path):
@@ -419,6 +551,264 @@ class ObjectStore:
         with self._serialized() as db:
             return db.execute("DELETE FROM build WHERE handle=?",
                               (handle,)).rowcount == 1
+
+    # -- workflow planning -------------------------------------------------
+
+    def _workflow_candidate_view(self, db, spec):
+        """Read and verify every declared cache candidate in one DB view.
+
+        The returned signature contains the current tag binding, blob length
+        and actual SHA-256 of every candidate.  It therefore changes not only
+        when a selected digest disappears, but also when any previously
+        unavailable candidate becomes useful.  This method never updates LRU
+        state.
+        """
+        signature = []
+        available = {}
+        for node in sorted(spec["candidates"]):
+            tag, expected_digest = spec["candidates"][node]
+            row = db.execute("""
+                SELECT t.digest, b.data
+                FROM tag t
+                LEFT JOIN blob b ON b.digest = t.digest
+                WHERE t.name = ?
+            """, (tag,)).fetchone()
+
+            if row is None:
+                signature.append((node, None, None, None))
+                continue
+
+            bound_digest, data = row
+            if data is None:
+                actual_digest = None
+                size = None
+            else:
+                size = len(data)
+                actual_digest = hashlib.sha256(data).hexdigest()
+
+            signature.append(
+                (node, bound_digest, size, actual_digest))
+
+            # The action's own tag must name its confirmed digest.  Reading
+            # the same bytes through some other tag does not make this
+            # candidate a hit.
+            if bound_digest == expected_digest \
+                    and data is not None \
+                    and size <= MAX_BLOB_SIZE \
+                    and actual_digest == expected_digest:
+                available[node] = (expected_digest, size)
+
+        return tuple(signature), available
+
+    def _read_workflow_view(self, spec):
+        """Take a short read snapshot and release the database lock."""
+        with closing(self.connection()) as db:
+            db.execute("BEGIN")
+            view = self._workflow_candidate_view(db, spec)
+            db.execute("COMMIT")
+        return view
+
+    @staticmethod
+    def _workflow_run_order(spec, run_mask):
+        """Topologically order run nodes, breaking ties by action ID."""
+        dep_masks = spec["dep_masks"]
+        ids = spec["ids"]
+        remaining = run_mask
+        order = []
+        while remaining:
+            ready_bit = 0
+            candidates = remaining
+            while candidates:
+                bit = candidates & -candidates
+                candidates ^= bit
+                node = bit.bit_length() - 1
+                if (dep_masks[node] & remaining) == 0:
+                    # Bits are visited from low to high, i.e. ascending ID.
+                    ready_bit = bit
+                    break
+            if ready_bit == 0:  # validation already rejected cycles
+                raise ValueError(
+                    "workflow dependencies must not contain a cycle")
+            node = ready_bit.bit_length() - 1
+            order.append(ids[node])
+            remaining ^= ready_bit
+        return order
+
+    def _plan_workflow(self, spec, view):
+        """Find the globally optimal cache/run split without using the DB.
+
+        There are at most 18 cache candidates, so enumerate those subsets.
+        Bit masks keep graph closure, work and unique-digest accounting
+        compact.  A selected cache node prunes its dependency closure; cache
+        bits made irrelevant by an upstream cache hit are excluded from the
+        actual returned reuse set.
+        """
+        _, available = view
+        ids = spec["ids"]
+        works = spec["works"]
+        dep_masks = spec["dep_masks"]
+        budget = spec["byte_budget"]
+
+        # Candidates outside the targets' full dependency closure can never be
+        # accessed; do not spend subset combinations on them.
+        reachable = spec["target_mask"]
+        pending = reachable
+        while pending:
+            bit = pending & -pending
+            pending ^= bit
+            node = bit.bit_length() - 1
+            new_deps = dep_masks[node] & ~reachable
+            reachable |= new_deps
+            pending |= new_deps
+
+        candidate_nodes = [
+            node for node in sorted(available)
+            if reachable & (1 << node)
+        ]
+        candidate_count = len(candidate_nodes)
+        candidate_masks = [1 << node for node in candidate_nodes]
+
+        best_key = None
+        best_run_mask = 0
+        best_cached_mask = 0
+
+        for choice in range(1 << candidate_count):
+            cache_mask = 0
+            bits = choice
+            candidate_index = 0
+            while bits:
+                if bits & 1:
+                    cache_mask |= candidate_masks[candidate_index]
+                bits >>= 1
+                candidate_index += 1
+
+            # Least closure starting at targets.  A cached node is satisfied
+            # by the cache and therefore does not expose its dependencies.
+            needed = spec["target_mask"]
+            pending = needed
+            while pending:
+                bit = pending & -pending
+                pending ^= bit
+                if cache_mask & bit:
+                    continue
+                node = bit.bit_length() - 1
+                new_deps = dep_masks[node] & ~needed
+                needed |= new_deps
+                pending |= new_deps
+
+            cached_mask = needed & cache_mask
+            run_mask = needed & ~cache_mask
+
+            byte_count = 0
+            seen_digests = set()
+            cached_bits = cached_mask
+            while cached_bits:
+                bit = cached_bits & -cached_bits
+                cached_bits ^= bit
+                node = bit.bit_length() - 1
+                digest, size = available[node]
+                if digest not in seen_digests:
+                    seen_digests.add(digest)
+                    byte_count += size
+            if byte_count > budget:
+                continue
+
+            work_total = 0
+            run_bits = run_mask
+            while run_bits:
+                bit = run_bits & -run_bits
+                run_bits ^= bit
+                work_total += works[bit.bit_length() - 1]
+
+            if best_key is not None:
+                best_work, best_bytes, _best_ids = best_key
+                if work_total > best_work \
+                        or (work_total == best_work
+                            and byte_count > best_bytes):
+                    continue
+
+            cached_ids = []
+            cached_bits = cached_mask
+            while cached_bits:
+                bit = cached_bits & -cached_bits
+                cached_bits ^= bit
+                cached_ids.append(ids[bit.bit_length() - 1])
+
+            key = (work_total, byte_count, tuple(cached_ids))
+            if best_key is None or key < best_key:
+                best_key = key
+                best_run_mask = run_mask
+                best_cached_mask = cached_mask
+
+        return {
+            "run_mask": best_run_mask,
+            "cached_mask": best_cached_mask,
+            "run_order": self._workflow_run_order(spec, best_run_mask),
+        }
+
+    def prepare_workflow(self, actions, targets, byte_budget):
+        """Plan a target workflow and atomically pin its cached outputs.
+
+        Candidate discovery and graph optimization do not hold a SQLite lock.
+        A final ``BEGIN IMMEDIATE`` admission transaction re-reads the complete
+        candidate view.  If any candidate changed during planning, the stale
+        plan is discarded and replanned outside the lock.  Once the planning
+        view equals the admission view, the checkout row and all action-ID
+        bindings are inserted in that same transaction.
+        """
+        spec = _validate_workflow(actions, targets, byte_budget)
+        view = self._read_workflow_view(spec)
+
+        while True:
+            plan = self._plan_workflow(spec, view)
+            stale = False
+            result = None
+
+            with self._serialized() as db:
+                current_view = self._workflow_candidate_view(db, spec)
+                if current_view[0] != view[0]:
+                    # Release the admission lock, replan from the new view,
+                    # and try admission again.  Do not admit a plan that only
+                    # rechecked its already-selected digests.
+                    view = current_view
+                    stale = True
+                else:
+                    cached_mask = plan["cached_mask"]
+                    run_order = plan["run_order"]
+                    if not cached_mask:
+                        result = (None, run_order, {})
+                    else:
+                        active, = db.execute(
+                            "SELECT COUNT(*) FROM build").fetchone()
+                        if active >= MAX_ACTIVE_BUILDS:
+                            raise ValueError(
+                                "too many active build checkouts")
+
+                        seq = self._next_counter(db, "next_handle")
+                        handle = "%x-%s" % (seq, secrets.token_hex(16))
+                        db.execute(
+                            "INSERT INTO build(handle, started) VALUES (?,?)",
+                            (handle, seq))
+
+                        cached = {}
+                        pins = []
+                        bits = cached_mask
+                        while bits:
+                            bit = bits & -bits
+                            bits ^= bit
+                            node = bit.bit_length() - 1
+                            action_id = spec["ids"][node]
+                            digest, _size = current_view[1][node]
+                            cached[action_id] = digest
+                            pins.append((handle, action_id, digest))
+
+                        db.executemany(
+                            "INSERT INTO build_pin(handle, name, digest) "
+                            "VALUES (?,?,?)", pins)
+                        result = (handle, run_order, cached)
+
+            if not stale:
+                return result
 
     # -- build transfer ---------------------------------------------------
 

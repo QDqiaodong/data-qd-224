@@ -29,6 +29,37 @@ store.finish_build(handle)
 
 保留关系按 digest 记在数据库里：同一 digest 被多个构建保留时，最后一个句柄释放后才解除保护。句柄、绑定和保留关系在重新打开后继续有效，不需要持有长连接。检出、构建读取和释放都不会刷新普通缓存的使用顺序。
 
+## 工作流计划
+
+`prepare_workflow(actions, targets, byte_budget)` 从目标动作的联合依赖图中决定哪些动作实际执行、哪些直接从缓存取，并为非空复用一次性创建按**动作 ID** 绑定的活动检出。
+
+- `actions` 含 1–64 个动作；动作 ID 是 1–48 个 ASCII 字母、数字、`_` 或 `-`。每个声明为 `(work, deps, tag, digest)`：`work` 是 1–1,000,000 的整数（不接受 `bool`），`deps` 是不重复且均已声明的动作 ID 元组。没有候选时后两项均为 `None`；否则是有效标签和 64 位小写 SHA-256。最多 18 个候选动作。
+- `targets` 是 1–24 个不重复的已声明动作 ID；`byte_budget` 是 0–24 MiB 的整数（不接受 `bool`）。所有动作和依赖都会校验，包括目标不可达节点；未知依赖、重复项、环或其它无效参数均抛 `ValueError`，且不会创建检出。
+- 候选只有在该动作**自己的标签**仍绑定指定 digest、库内副本存在、长度不超过 1 MiB 且 SHA-256 校验通过时才可命中。标签缺失、换绑或副本损坏只使该候选不可用；同一 digest 能从别的标签读到不能替代本标签。不会修复或删除坏副本。
+- 命中一个动作后不再访问它的依赖；未命中的动作必须执行并继续满足其依赖。同一动作只执行或复用一次，不可达动作不进入计划。预算按所选 digest 的唯一实际字节数计算；多个动作选中同一 digest 时，`cached` 分别列出动作，但字节只计一次。
+- 优化顺序为：实际执行动作的 `work` 总和最小 → 唯一复用字节最少 → 升序复用动作 ID 元组的字典序最小。搜索比较所有目标的联合闭包，而不是分别拼接分支。`run_order` 只包含待执行动作；仍需执行的依赖先运行，每一步在可运行动作中取最小 ID。
+
+```python
+handle, run_order, cached = store.prepare_workflow(
+    {
+        "A": (6, ("P",), "tag-a", digest_x),
+        "B": (6, ("P",), "tag-b", digest_x),
+        "P": (10, (), None, None),
+        "C": (9, (), "tag-c", digest_y),
+    },
+    ["A", "B", "C"],
+    4,
+)
+# 预算只收一份 X 的 4 字节：cached == {"A": digest_x, "B": digest_x}
+# run_order == ["C"]
+store.fetch_for_build(handle, "A")       # 按动作 ID 读取，而不是 "tag-a"
+store.describe_build(handle)             # 键也是 "A"、"B"
+```
+
+`cached` 非空时，返回前用一个最终 `BEGIN IMMEDIATE` 准入事务同时创建检出和全部动作 ID 绑定，占用现有 64 个活动检出名额之一。最终视图名额已满会抛 `ValueError`，不会改交较差计划。`cached` 为空时返回 `handle=None`，不占名额，即使已有 64 个检出也能交付全执行计划。
+
+候选快照读取和最多 `2^18` 个子集的图搜索都在数据库事务外进行，不持有阻塞其它连接提交的 SQLite 锁。最终准入会重新读取全部候选的标签绑定、长度和实际 SHA-256；只要任何候选（包括原先不可用或未选中的候选）发生变化，就释放准入锁、按新视图重算并再次尝试。因此并发修改停止后会得到最终视图中的全局最优计划。探测、计划、绑定和准入都不刷新普通 LRU，也不修改标签、容量或驻留对象；失败事务不留下检出或保护关系。
+
 ## 容量准入
 
 `configure_capacity(max_bytes)` 持久设置容量（0 到 1 GiB 的整数，不接受 `bool`），成功返回 `None`；未配置时保持原有的无容量模式。容量按库中实际驻留的唯一 digest 的字节数求和：按标签数、构建数或 SQLite 文件长度都不计费，尚未回收的无引用字节也占容量。
@@ -72,8 +103,8 @@ handle2, bindings = dest.install_build(
 python3 -B -m unittest -v
 ```
 
-所有测试都在临时 SQLite 文件上运行，不触碰仓库内文件。`test_scale.py` 会建立 112 个各 1 MiB 的旧格式对象、原地升级并在 Linux 子进程的 96 MiB 地址空间限制内降到 64 MiB，然后校验留下的制品可读。`test_build_transfer.py` 覆盖缺件传输、同名标签不换绑、驱逐保护、同步点并发、截短/尾随/错 digest、坏副本修复与失败回滚；其中 Linux 规模用例在两个子进程里经 FIFO 和非 seek 的限块读写接口传输 24 个 1 MiB 制品，并以模块载入后实测虚拟内存加 16 MiB 设置地址空间上限。只跑某个文件：
+所有测试都在临时 SQLite 文件上运行，不触碰仓库内文件。`test_workflow_plan.py` 覆盖联合图优化、共享 digest 预算、标签换绑/损坏未命中、平局规则、零字节候选、不可达节点校验、并发候选恢复后的最终重算、动作 ID 检出保护、64 槽原子准入和 LRU 不变；`test_scale.py` 会建立 112 个各 1 MiB 的旧格式对象、原地升级并在 Linux 子进程的 96 MiB 地址空间限制内降到 64 MiB，然后校验留下的制品可读。`test_build_transfer.py` 覆盖缺件传输、同名标签不换绑、驱逐保护、同步点并发、截短/尾随/错 digest、坏副本修复与失败回滚；其中 Linux 规模用例在两个子进程里经 FIFO 和非 seek 的限块读写接口传输 24 个 1 MiB 制品，并以模块载入后实测虚拟内存加 16 MiB 设置地址空间上限。只跑某个文件：
 
 ```sh
-python3 -B -m unittest -v test_objects test_builds_capacity test_scale test_build_transfer
+python3 -B -m unittest -v test_objects test_builds_capacity test_workflow_plan test_scale test_build_transfer
 ```
