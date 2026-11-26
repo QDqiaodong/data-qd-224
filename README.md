@@ -93,6 +93,22 @@ store.describe_build(handle)             # 键也是 "A"、"B"
 
 候选快照读取和最多 `2^18` 个子集的图搜索都在数据库事务外进行，不持有阻塞其它连接提交的 SQLite 锁。最终准入会重新读取全部候选的标签绑定、长度和实际 SHA-256；只要任何候选（包括原先不可用或未选中的候选）发生变化，就释放准入锁、按新视图重算并再次尝试。因此并发修改停止后会得到最终视图中的全局最优计划。探测、计划、绑定和准入都不刷新普通 LRU，也不修改标签、容量或驻留对象；失败事务不留下检出或保护关系。
 
+## 复现证据与受检读取
+
+普通缓存校验只能证明取到的是某个 SHA-256 对应的字节，不能证明独立重建环境会得到同一产物。协调方在重建完成后**只上报整件 SHA-256**，存储据此登记观察、给出判定，并允许执行器在判定通过时才取字节。整个过程只处理观察元数据与标签绑定，不实现重建调度或远程服务。
+
+```python
+store.record_rebuilds(case_id, [(runner, image, digest), ...])
+status, digest = store.rebuild_verdict(case_id)
+digest, data = store.fetch_reproduced(case_id, "artifact")
+```
+
+- `record_rebuilds(case_id, updates)`：`case_id` 是 0–255 的整数（不接受 `bool`），`updates` 是 1–128 项的 list/tuple，每项为 `(runner, image, digest)`。`digest` 是 64 位小写十六进制 SHA-256，或 `None` 表示撤掉该组合的当前观察。`runner` / `image` 各是 0–31 的整数（不接受 `bool`），分别代表节点共因与镜像谱系共因，两种编号互不相关。同一批不得重复指定 `(runner, image)`；重复登记原值或撤掉不存在的观察没有额外影响。每组只保留每个组合的当前值，不积累历史，不同组互不影响。无效参数抛 `ValueError` 且整批不落地；有效批次在一个事务中一次生效，重开同一路径也只看到完整批次。登记不要求库内存在该摘要的字节。
+- `rebuild_verdict(case_id)`：返回 `(status, digest_or_none)`。某摘要只有在能从报告它的当前观察中挑出三条**两两既不共享节点组、也不共享镜像谱系**的观察时才有资格——两侧各自出现三种编号并不足够。没有摘要达标返回 `("pending", None)`，恰有一个返回 `("verified", digest)`，多个返回 `("contested", None)`；不以总票数、上报顺序或产物是否已入库打破冲突。未上报过的有效组视为零条观察，组编号无效抛 `ValueError`。
+- `fetch_reproduced(case_id, name)`：按 `name` 当前的普通标签绑定读取，不从其它标签寻找已判定对象。标签不存在抛 `KeyError`；组无唯一达标结果抛 `UnverifiedArtifact`，`reason` 为 `"pending"` 或 `"contested"`；唯一达标摘要与绑定不符时同抛该异常，`reason` 为 `"different_digest"`，此时不交付任何字节。判定通过后才实际校验整件 SHA-256，字节缺失或不符抛 `CorruptBlob`。观察、绑定和待校验字节来自同一次短暂读快照内存在的完整库内视图；独立性判定和整件哈希都在该快照释放后进行，不持有阻塞其它连接提交的锁。受检读取不新建构建句柄、不刷新普通使用顺序，也不浏览除当前组观察与该标签一件产物之外的元数据。
+
+观察既不是协调完成标记，也不是回收根，不保留制品、不占用容量；普通发布、读取、回收、检出、传输、工作流、协调产出和两种容量规则都按原行为工作。发布和移除（包括换绑）不写入或清除复现证据，因此移除最后一个标签并回收后仍能看到判定，受检读取则因标签不存在抛 `KeyError`。两个模式（整件与共享块）都支持受检读取，判定本身不读取或校验制品字节。观察上限由 256 个组、每组 32×32 个组合确定。
+
 ## 容量准入
 
 `configure_capacity(max_bytes)` 持久设置容量（0 到 1 GiB 的整数，不接受 `bool`），成功返回 `None`；未配置时保持原有的无容量模式。容量按库中实际驻留的唯一 digest 的字节数求和：按标签数、构建数或 SQLite 文件长度都不计费，尚未回收的无引用字节也占容量。
@@ -163,8 +179,10 @@ python3 -B -m unittest -v
 所有测试都在临时 SQLite 文件上运行，不触碰仓库内文件。`test_output_coordination.py` 覆盖 AND-of-OR 等待、确定性 SCC 解围和旁观者保护、自环、重开后的失效令牌、完成标记与普通发布/移除/驱逐的关系、损坏 ready 制品、容量失败保留生产权、Barrier 同步的双连接领权竞争、256 生产槽与 LRU 不变；其中 Linux 验收用例先在父进程备好 80 个 1 MiB 制品和 256 个生产者及多组独立链/跨组长链，再在冷开子进程导入并打开库后按当时 `VmSize + 24 MiB` 设置 `RLIMIT_AS`，执行一次闭链等待更新和解围。`test_workflow_plan.py` 覆盖联合图优化、共享 digest 预算、标签换绑/损坏未命中、平局规则、零字节候选、不可达节点校验、并发候选恢复后的最终重算、动作 ID 检出保护、64 槽原子准入和 LRU 不变；`test_scale.py` 会建立 112 个各 1 MiB 的旧格式对象、原地升级并在 Linux 子进程的 96 MiB 地址空间限制内降到 64 MiB，然后校验留下的制品可读。`test_build_transfer.py` 覆盖缺件传输、同名标签不换绑、驱逐保护、同步点并发、截短/尾随/错 digest、坏副本修复与失败回滚；其中 Linux 规模用例在两个子进程里经 FIFO 和非 seek 的限块读写接口传输 24 个 1 MiB 制品，并以模块载入后实测虚拟内存加 16 MiB 设置地址空间上限。运行一条命令执行全部新旧回归：
 
 ```sh
-python3 -B -m unittest -v test_objects test_builds_capacity test_workflow_plan test_scale test_build_transfer test_output_coordination test_shared_payload
+python3 -B -m unittest -v test_objects test_builds_capacity test_workflow_plan test_scale test_build_transfer test_output_coordination test_shared_payload test_reproducibility
 ```
+
+`test_reproducibility.py` 在临时库覆盖：含 `(0,0)、(0,1)、(1,0)、(2,2)` 的复现组允许受检读取 A（按组合顺序贪心会漏掉合法选法），把 `(1,0)` 换成 `(1,2)` 后两侧仍各有三种编号却必须 pending 拒读，恢复 A 并为未入库的 B 补三条独立观察后 contested 拒读而普通读取仍返回 A，撤掉 A 的关键观察后 `different_digest` 且旧标签既拿不到 A 也不被替换为 B，换绑到 B 才交付 B；无效批次中的合法改动不生效、不同组互不影响、重开后结论仍可用。同步点用例暂停一次已捕获旧判定输入、旧绑定和 A 字节但尚未完成整件校验的受检读取，期间另一连接依次原子修改观察、换绑标签、回收失去引用的 A，三次写均提交后恢复；该调用只能整套返回旧结果或整套返回新结果，之后的调用只能得到 B。共享块用例验证唯一达标且仍绑定的制品载荷受损时受检读取报 `CorruptBlob` 而判定仍为 verified，移除最后标签并回收后判定仍在、受检读取报 `KeyError`，并确认旧库无需配置、受检读取不刷新使用顺序。
 
 `test_shared_payload.py` 用临时库覆盖共享块计量与库内配置、共享块上的“先逻辑淘汰、后物理准入”、失败事务状态、块内重复与回收、共享块损坏后的普通发布/配方完成拒绝修复、`install_build` 原子修复与双向旧端传输、工作流按整件长度计预算、配方令牌重试，以及 48 个 1 MiB 整件共享前 15 块时的字节数和 SQLite 已使用页上限。
 

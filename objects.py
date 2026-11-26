@@ -39,6 +39,9 @@ MAX_WORKFLOW_BUDGET = 24 << 20
 MAX_OUTPUT_PRODUCERS = 256
 MAX_WAIT_CLAUSES = 16
 MAX_CLAUSE_KEYS = 16
+MAX_REBUILD_CASES = 256
+MAX_REBUILD_NODES = 32
+MAX_REBUILD_UPDATES = 128
 TRANSFER_CHUNK = 1 << 16
 SHARED_BLOCK_SIZE = 1 << 16
 SHARED_CAPACITY_KEY = "shared_payload_capacity"
@@ -67,6 +70,25 @@ class StaleOutputClaim(Exception):
 class OutputWaiting(Exception):
     """A completion was refused because a declared wait has no coordinated
     output yet."""
+
+
+class UnverifiedArtifact(Exception):
+    """A checked read has no unique reproduction-verified result to deliver.
+
+    ``reason`` is ``"pending"`` when no digest in the case qualifies,
+    ``"contested"`` when several digests qualify, and ``"different_digest"``
+    when the single verified digest is not the one the tag is bound to.
+    """
+
+    def __init__(self, reason, case_id=None, digest=None):
+        self.reason = reason
+        self.case_id = case_id
+        self.digest = digest
+        super().__init__(
+            "reproduction check %r%s%s"
+            % (reason,
+               "" if case_id is None else " for case %r" % (case_id,),
+               "" if digest is None else " (%s)" % digest))
 
 
 class TransferBaseUnavailable(Exception):
@@ -298,6 +320,108 @@ def _validate_workflow(actions, targets, byte_budget):
     }
 
 
+def _valid_rebuild_case(case_id):
+    return not isinstance(case_id, bool) \
+        and isinstance(case_id, int) \
+        and 0 <= case_id < MAX_REBUILD_CASES
+
+
+def _valid_rebuild_node(value):
+    return not isinstance(value, bool) \
+        and isinstance(value, int) \
+        and 0 <= value < MAX_REBUILD_NODES
+
+
+def _validate_rebuild_updates(updates):
+    """Validate one batch of rebuild observations, all-or-nothing.
+
+    Returns a list of ``(runner, image, digest_or_None)`` tuples in the order
+    given.  A digest of ``None`` withdraws the current observation for that
+    (runner, image) combination.  One batch may not name a combination twice.
+    """
+    if not isinstance(updates, (list, tuple)):
+        raise ValueError("updates must be a list or tuple of observations")
+    if not 1 <= len(updates) <= MAX_REBUILD_UPDATES:
+        raise ValueError(
+            "updates must contain 1 to %d observations" % MAX_REBUILD_UPDATES)
+
+    normalized = []
+    seen = set()
+    for item in updates:
+        if not isinstance(item, (list, tuple)) or len(item) != 3:
+            raise ValueError(
+                "each update must be (runner, image, digest-or-None)")
+        runner, image, digest = item
+        if not _valid_rebuild_node(runner):
+            raise ValueError(
+                "runner must be an integer between 0 and %d"
+                % (MAX_REBUILD_NODES - 1))
+        if not _valid_rebuild_node(image):
+            raise ValueError(
+                "image must be an integer between 0 and %d"
+                % (MAX_REBUILD_NODES - 1))
+        if digest is not None:
+            if not isinstance(digest, str) \
+                    or _DIGEST_RE.match(digest) is None:
+                raise ValueError(
+                    "digest must be 64 lowercase hex characters or None")
+        combination = (runner, image)
+        if combination in seen:
+            raise ValueError(
+                "one batch may not name a (runner, image) twice")
+        seen.add(combination)
+        normalized.append((runner, image, digest))
+    return normalized
+
+
+def _has_independent_triple(combinations):
+    """True iff three observations are pairwise independent.
+
+    A qualifying trio has three distinct runner groups *and* three distinct
+    image lineages, which is exactly a matching of size three in the
+    bipartite graph whose edges are the (runner, image) observations.
+    """
+    if len(combinations) < 3:
+        return False
+    adjacency = {}
+    for runner, image in combinations:
+        adjacency.setdefault(runner, set()).add(image)
+
+    # Kuhn's augmenting-path matching, capped once size three is reached.
+    match_image = {}  # image -> runner
+
+    def augment(runner, visited):
+        for image in adjacency[runner]:
+            if image in visited:
+                continue
+            visited.add(image)
+            if image not in match_image or augment(match_image[image], visited):
+                match_image[image] = runner
+                return True
+        return False
+
+    matched = 0
+    for runner in sorted(adjacency):
+        if augment(runner, set()):
+            matched += 1
+            if matched >= 3:
+                return True
+    return False
+
+
+def _reproducible_triple(observations):
+    """Return True iff any digest has three pairwise-independent observations.
+
+    ``observations`` is ``{digest: {(runner, image), ...}}`` for the current
+    observations in one case.  Two observations are independent only when
+    both their runner groups and their image lineages differ.  Merely seeing
+    three distinct numbers on each side of a set is not sufficient; the trio
+    must be realizable as an actual set of three observations.
+    """
+    return any(_has_independent_triple(combinations)
+               for combinations in observations.values())
+
+
 def _rmtree(path):
     """Remove a private staging directory."""
     shutil.rmtree(path, ignore_errors=True)
@@ -368,6 +492,12 @@ class ObjectStore:
                 block_hash TEXT NOT NULL
                     REFERENCES shared_block(block_hash),
                 PRIMARY KEY (digest, block_idx));
+            CREATE TABLE IF NOT EXISTS rebuild_observation (
+                case_id INTEGER NOT NULL,
+                runner INTEGER NOT NULL,
+                image INTEGER NOT NULL,
+                digest TEXT NOT NULL,
+                PRIMARY KEY (case_id, runner, image));
             CREATE INDEX IF NOT EXISTS tag_digest ON tag(digest);
             CREATE INDEX IF NOT EXISTS build_pin_digest
                 ON build_pin(digest);
@@ -841,6 +971,142 @@ class ObjectStore:
             for digest in digests:
                 self._delete_blob(db, digest)
             return len(digests)
+
+    # -- rebuild observations and checked reads ---------------------------
+
+    @staticmethod
+    def _case_observations(db, case_id):
+        """Return ``{digest: {(runner, image), ...}}`` for one case.
+
+        Metadata only: no blob row is read and no artifact byte is hashed.
+        """
+        observations = {}
+        rows = db.execute("""
+            SELECT runner, image, digest
+            FROM rebuild_observation
+            WHERE case_id=?
+        """, (case_id,))
+        for runner, image, digest in rows:
+            observations.setdefault(digest, set()).add((runner, image))
+        return observations
+
+    @classmethod
+    def _verdict_from_observations(cls, observations):
+        """Return ``(status, digest_or_none)`` for a metadata-only view."""
+        qualifying = sorted(
+            digest for digest, combinations in observations.items()
+            if _has_independent_triple(combinations))
+        if not qualifying:
+            return "pending", None
+        if len(qualifying) == 1:
+            return "verified", qualifying[0]
+        return "contested", None
+
+    def record_rebuilds(self, case_id, updates):
+        """Register or withdraw rebuild observations for one case.
+
+        ``updates`` is 1-128 items of ``(runner, image, digest)`` where digest
+        is a 64-character lowercase hex SHA-256 or ``None`` to withdraw the
+        current observation for that (runner, image) combination.  The whole
+        batch is validated before touching the database and then applied in a
+        single transaction.  No artifact bytes are required or inspected.
+        """
+        if not _valid_rebuild_case(case_id):
+            raise ValueError(
+                "case_id must be an integer between 0 and %d"
+                % (MAX_REBUILD_CASES - 1))
+        normalized = _validate_rebuild_updates(updates)
+        with self._serialized() as db:
+            for runner, image, digest in normalized:
+                if digest is None:
+                    db.execute("""
+                        DELETE FROM rebuild_observation
+                        WHERE case_id=? AND runner=? AND image=?
+                    """, (case_id, runner, image))
+                else:
+                    db.execute("""
+                        INSERT INTO rebuild_observation
+                            (case_id, runner, image, digest)
+                        VALUES (?,?,?,?)
+                        ON CONFLICT(case_id, runner, image)
+                        DO UPDATE SET digest=excluded.digest
+                    """, (case_id, runner, image, digest))
+        return None
+
+    def rebuild_verdict(self, case_id):
+        """Return ``(status, digest_or_none)`` for one reproduction case.
+
+        ``status`` is ``"pending"`` when no digest has three pairwise
+        independent current observations, ``"verified"`` when exactly one does
+        (and its digest is returned), and ``"contested"`` when more than one
+        does.  Observation metadata only; no artifact bytes are read.
+        """
+        if not _valid_rebuild_case(case_id):
+            raise ValueError(
+                "case_id must be an integer between 0 and %d"
+                % (MAX_REBUILD_CASES - 1))
+        with self._serialized() as db:
+            observations = self._case_observations(db, case_id)
+        return self._verdict_from_observations(observations)
+
+    def _reproduced_view(self, case_id, name):
+        """Capture observations, the tag binding and that one payload.
+
+        All three are read in a single short read snapshot, so they describe a
+        complete database view that existed during this call.  The snapshot is
+        released before the caller computes independence or hashes bytes.
+        """
+        with closing(self.connection()) as db:
+            db.execute("BEGIN")
+            try:
+                observations = self._case_observations(db, case_id)
+                row = db.execute(
+                    "SELECT digest FROM tag WHERE name=?", (name,)).fetchone()
+                bound = None if row is None else row[0]
+                data = None if bound is None else self._read_blob(db, bound)
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+            db.execute("COMMIT")
+        return observations, bound, data
+
+    def _check_reproduced_payload(self, digest, data):
+        """Verify the captured whole payload; CorruptBlob on absence/mismatch."""
+        if data is None or hashlib.sha256(data).hexdigest() != digest:
+            raise CorruptBlob(digest)
+
+    def fetch_reproduced(self, case_id, name):
+        """Read one tag's current payload only if reproduction verifies it.
+
+        The current binding of *name* is used; no other tag is consulted.
+        Raises ``KeyError`` when the tag is absent, ``UnverifiedArtifact`` when
+        the case has no unique qualifying digest (reason ``"pending"`` or
+        ``"contested"``) or when the unique digest is not the bound one
+        (reason ``"different_digest"``), and ``CorruptBlob`` when the verified
+        payload is missing or fails its whole SHA-256 check.  The read does not
+        create a build handle and does not refresh ordinary LRU order.
+        """
+        if not _valid_rebuild_case(case_id):
+            raise ValueError(
+                "case_id must be an integer between 0 and %d"
+                % (MAX_REBUILD_CASES - 1))
+        if not _valid_tag(name):
+            raise ValueError("a non-empty tag is required")
+
+        observations, bound, data = self._reproduced_view(case_id, name)
+        if bound is None:
+            raise KeyError(name)
+
+        status, digest = self._verdict_from_observations(observations)
+        if status == "pending":
+            raise UnverifiedArtifact("pending", case_id)
+        if status == "contested":
+            raise UnverifiedArtifact("contested", case_id)
+        if digest != bound:
+            raise UnverifiedArtifact("different_digest", case_id, digest)
+
+        self._check_reproduced_payload(digest, data)
+        return digest, data
 
     # -- build checkout ---------------------------------------------------
 
