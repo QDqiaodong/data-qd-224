@@ -29,6 +29,39 @@ store.finish_build(handle)
 
 保留关系按 digest 记在数据库里：同一 digest 被多个构建保留时，最后一个句柄释放后才解除保护。句柄、绑定和保留关系在重新打开后继续有效，不需要持有长连接。检出、构建读取和释放都不会刷新普通缓存的使用顺序。
 
+## 单次生产协调与死锁解围
+
+多个 worker 未命中同一配方时，用配方键（同时也是普通标签名；1–48 个 ASCII 字母、数字、`_`、`-`）领取唯一生产权。协调状态和普通缓存位于同一个 SQLite 文件，所有等待替换、解围撤销和完成提交都在一个 `BEGIN IMMEDIATE` 事务中串行生效。
+
+```python
+status, token = store.claim_output("linux-header")
+# status == "claimed"；已有生产者时为 ("busy", None)，已有协调产出时
+# 校验字节后为 ("ready", data)。
+
+store.set_output_waits(
+    token,
+    [["linux-clang", "linux-gcc"], ["headers"]],
+)
+# 子句之间是 AND；["linux-clang", "linux-gcc"] 表示任一兼容提供方即可。
+
+digest = store.complete_output(token, header_bytes)
+```
+
+- `claim_output(key)`：已有活动生产权时返回 `("busy", None)`，绝不返回他人令牌；否则若存在当前协调产出，校验实际字节 SHA-256 后返回 `("ready", data)`，坏字节抛 `CorruptBlob`；都没有才返回 `("claimed", token)`。最多 256 个活动生产者，满额只阻止新领权（`ValueError`），不影响 busy/ready，也不占用 64 个构建检出名额。
+- `set_output_waits(token, groups)`：先整体校验 0–16 个 list/tuple 子句，每子句 1–16 个互不重复的有效键；然后整体替换等待并在同一事务内解围，返回按实际撤销顺序排列的配方键元组（可能包含调用者）。空序列清除等待。
+- `complete_output(token, data)`：接受当前令牌和 0–1 MiB `bytes`。提交视图中每个已声明子句都必须至少有一个**当前协调产出**，否则抛 `OutputWaiting` 并保留令牌和全部等待；未认领或仅可推进不算产出。检查先于制品准入。成功时按现有内容寻址、完整性、容量、驱逐和 LRU 规则发布到同名普通标签，写入一次性完成标记，删除生产权和等待，并返回 digest。容量/完整性失败整体回滚，令牌仍可重试。
+- `cancel_output(token)`：删除当前生产权及等待但不删除普通标签；成功 `True`，未知或已失效令牌 `False`。已释放、已被解围撤销或已完成的令牌再调用 `set_output_waits` / `complete_output` 一律抛 `StaleOutputClaim`。无效参数抛 `ValueError`；参数有效而令牌失效时，失效判断先于等待或容量业务。
+
+完成标记只在标记与同名、同 digest 标签绑定同时存在时有效。普通 `publish(key, ...)`（即使 digest 相同）、`remove(key)` 或容量驱逐删除该标签都会在同一事务内使标记失效；之后再次普通发布同名不会复活旧标记。只共享 digest 的其它标签或其独立完成标记不受影响。标记不固定 blob、不是新的回收根，也不保留历史。等待判断只读取配方、等待和“标记+标签绑定”元数据，不重算依赖制品摘要；只有 `claim_output` 实际返回 ready 字节时才校验 SHA-256。除成功的 `complete_output` 外，这些入口不刷新普通 LRU。
+
+解围使用替换等待后的完整已提交状态，而不是单次调用的静态图：
+
+1. 已有当前协调产出的键、以及当前没有活动生产者的键，首先是“可能推进”的键；空闲键视为调度器可另派 worker，不考虑外部 worker 池或 256 个生产槽是否耗尽。
+2. 活动生产者只有在每个 AND 子句都至少有一个已可能推进的 OR 候选时才变为可能推进；单调扩展到不动点，因此环内成员不能互相担保。
+3. 对剩余无法推进的生产者，只取“整条子句都没有可能推进候选”的子句，从等待者向其中所有候选键的当前生产者连边。
+4. 在该图没有出边到其它分量的强连通分量（包括自环）中，汇总全部键并取 ASCII 字典序最小者，撤销其当前令牌和等待。指入死锁分量、但自身分量有出边的上游旁观者不会被撤销。
+5. 以撤销后的新状态重复判断，直到没有死锁；撤销只释放资格，不发布制品。
+
 ## 工作流计划
 
 `prepare_workflow(actions, targets, byte_budget)` 从目标动作的联合依赖图中决定哪些动作实际执行、哪些直接从缓存取，并为非空复用一次性创建按**动作 ID** 绑定的活动检出。
@@ -103,8 +136,14 @@ handle2, bindings = dest.install_build(
 python3 -B -m unittest -v
 ```
 
-所有测试都在临时 SQLite 文件上运行，不触碰仓库内文件。`test_workflow_plan.py` 覆盖联合图优化、共享 digest 预算、标签换绑/损坏未命中、平局规则、零字节候选、不可达节点校验、并发候选恢复后的最终重算、动作 ID 检出保护、64 槽原子准入和 LRU 不变；`test_scale.py` 会建立 112 个各 1 MiB 的旧格式对象、原地升级并在 Linux 子进程的 96 MiB 地址空间限制内降到 64 MiB，然后校验留下的制品可读。`test_build_transfer.py` 覆盖缺件传输、同名标签不换绑、驱逐保护、同步点并发、截短/尾随/错 digest、坏副本修复与失败回滚；其中 Linux 规模用例在两个子进程里经 FIFO 和非 seek 的限块读写接口传输 24 个 1 MiB 制品，并以模块载入后实测虚拟内存加 16 MiB 设置地址空间上限。只跑某个文件：
+所有测试都在临时 SQLite 文件上运行，不触碰仓库内文件。`test_output_coordination.py` 覆盖 AND-of-OR 等待、确定性 SCC 解围和旁观者保护、自环、重开后的失效令牌、完成标记与普通发布/移除/驱逐的关系、损坏 ready 制品、容量失败保留生产权、Barrier 同步的双连接领权竞争、256 生产槽与 LRU 不变；其中 Linux 验收用例先在父进程备好 80 个 1 MiB 制品和 256 个生产者及多组独立链/跨组长链，再在冷开子进程导入并打开库后按当时 `VmSize + 24 MiB` 设置 `RLIMIT_AS`，执行一次闭链等待更新和解围。`test_workflow_plan.py` 覆盖联合图优化、共享 digest 预算、标签换绑/损坏未命中、平局规则、零字节候选、不可达节点校验、并发候选恢复后的最终重算、动作 ID 检出保护、64 槽原子准入和 LRU 不变；`test_scale.py` 会建立 112 个各 1 MiB 的旧格式对象、原地升级并在 Linux 子进程的 96 MiB 地址空间限制内降到 64 MiB，然后校验留下的制品可读。`test_build_transfer.py` 覆盖缺件传输、同名标签不换绑、驱逐保护、同步点并发、截短/尾随/错 digest、坏副本修复与失败回滚；其中 Linux 规模用例在两个子进程里经 FIFO 和非 seek 的限块读写接口传输 24 个 1 MiB 制品，并以模块载入后实测虚拟内存加 16 MiB 设置地址空间上限。运行一条命令执行全部新旧回归：
 
 ```sh
-python3 -B -m unittest -v test_objects test_builds_capacity test_workflow_plan test_scale test_build_transfer
+python3 -B -m unittest -v test_objects test_builds_capacity test_workflow_plan test_scale test_build_transfer test_output_coordination
+```
+
+也可用 unittest 自动发现：
+
+```sh
+python3 -B -m unittest -v
 ```

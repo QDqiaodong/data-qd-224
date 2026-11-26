@@ -36,9 +36,13 @@ MAX_WORKFLOW_ACTIONS = 64
 MAX_WORKFLOW_TARGETS = 24
 MAX_WORKFLOW_CANDIDATES = 18
 MAX_WORKFLOW_BUDGET = 24 << 20
+MAX_OUTPUT_PRODUCERS = 256
+MAX_WAIT_CLAUSES = 16
+MAX_CLAUSE_KEYS = 16
 TRANSFER_CHUNK = 1 << 16
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _ACTION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,48}\Z")
+_RECIPE_KEY_RE = _ACTION_ID_RE
 
 
 class CorruptBlob(Exception):
@@ -47,6 +51,16 @@ class CorruptBlob(Exception):
 
 class CapacityExceeded(Exception):
     pass
+
+
+class StaleOutputClaim(Exception):
+    """An output-claim token has already completed, been cancelled or lost
+    deadlock resolution."""
+
+
+class OutputWaiting(Exception):
+    """A completion was refused because a declared wait has no coordinated
+    output yet."""
 
 
 class TransferBaseUnavailable(Exception):
@@ -109,6 +123,46 @@ def _validate_needed(needed, known):
             raise ValueError(
                 "every needed digest must occur in the manifest")
     return needed
+
+
+def _valid_recipe_key(key):
+    return isinstance(key, str) and _RECIPE_KEY_RE.match(key) is not None
+
+
+def _validate_wait_groups(groups):
+    """Validate and normalize the AND-of-OR wait declaration.
+
+    The outer sequence contains at most 16 clauses.  Each clause contains
+    1-16 distinct recipe keys; candidates in one clause are alternatives.
+    The same key may occur in several clauses and self-dependencies are
+    allowed.
+    """
+    if not isinstance(groups, (list, tuple)):
+        raise ValueError("wait groups must be a list or tuple")
+    if len(groups) > MAX_WAIT_CLAUSES:
+        raise ValueError(
+            "at most %d wait clauses are allowed" % MAX_WAIT_CLAUSES)
+
+    normalized = []
+    for clause in groups:
+        if not isinstance(clause, (list, tuple)):
+            raise ValueError("each wait clause must be a list or tuple")
+        if not 1 <= len(clause) <= MAX_CLAUSE_KEYS:
+            raise ValueError(
+                "each wait clause must contain 1 to %d recipe keys"
+                % MAX_CLAUSE_KEYS)
+        keys = []
+        seen = set()
+        for key in clause:
+            if not _valid_recipe_key(key):
+                raise ValueError(
+                    "recipe keys must be 1-48 ASCII letters, digits, '_' or '-'")
+            if key in seen:
+                raise ValueError("recipe keys in one wait clause must be distinct")
+            seen.add(key)
+            keys.append(key)
+        normalized.append(tuple(keys))
+    return tuple(normalized)
 
 
 def _validate_workflow(actions, targets, byte_budget):
@@ -281,12 +335,40 @@ class ObjectStore:
             CREATE TABLE IF NOT EXISTS store_meta (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS output_claim (
+                token TEXT PRIMARY KEY,
+                recipe_key TEXT NOT NULL UNIQUE,
+                seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS output_wait (
+                token TEXT NOT NULL
+                    REFERENCES output_claim(token) ON DELETE CASCADE,
+                clause_idx INTEGER NOT NULL,
+                dep_key TEXT NOT NULL,
+                PRIMARY KEY (token, clause_idx, dep_key));
+            CREATE TABLE IF NOT EXISTS output_commit (
+                recipe_key TEXT PRIMARY KEY,
+                digest TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS tag_digest ON tag(digest);
             CREATE INDEX IF NOT EXISTS build_pin_digest
                 ON build_pin(digest);
+            CREATE INDEX IF NOT EXISTS output_wait_dep
+                ON output_wait(dep_key);
+            CREATE INDEX IF NOT EXISTS output_commit_digest
+                ON output_commit(digest);
         """.split(";"):
             if statement.strip():
                 db.execute(statement)
+        # A coordinated completion is valid only while its ordinary label
+        # binding remains.  Every label deletion path therefore invalidates the
+        # marker in the same transaction.  Ordinary rebinding uses an upsert
+        # and is handled explicitly by publish().
+        db.execute("""
+            CREATE TRIGGER IF NOT EXISTS output_tag_deleted
+            AFTER DELETE ON tag
+            BEGIN
+                DELETE FROM output_commit WHERE recipe_key = OLD.name;
+            END
+        """)
 
     def connection(self):
         db = sqlite3.connect(self.path, timeout=60.0, isolation_level=None)
@@ -448,6 +530,11 @@ class ObjectStore:
                                  (digest,)).fetchone()
             if stored != data:
                 raise CorruptBlob(digest)
+            # Ordinary publication, even of the identical digest, is not a
+            # coordinated completion credential.  This and the tag upsert are
+            # atomic with the rest of publish().
+            db.execute("DELETE FROM output_commit WHERE recipe_key=?",
+                       (name,))
             db.execute("""INSERT INTO tag VALUES (?,?)
                           ON CONFLICT(name) DO UPDATE SET digest=excluded.digest""",
                        (name, digest))
@@ -474,6 +561,10 @@ class ObjectStore:
 
     def remove(self, name):
         with self._serialized() as db:
+            # Also clear a marker left non-current by an out-of-band state;
+            # normal tag deletion already fires the invalidation trigger.
+            db.execute("DELETE FROM output_commit WHERE recipe_key=?",
+                       (name,))
             return db.execute("DELETE FROM tag WHERE name=?",
                               (name,)).rowcount == 1
 
@@ -551,6 +642,292 @@ class ObjectStore:
         with self._serialized() as db:
             return db.execute("DELETE FROM build WHERE handle=?",
                               (handle,)).rowcount == 1
+
+    # -- single-production coordination -----------------------------------
+
+    @staticmethod
+    def _current_output_keys(db):
+        """Return recipe keys with a valid commit marker and label binding.
+
+        This is metadata-only: blob bytes are neither loaded nor rehashed for
+        wait resolution or completion admission.
+        """
+        return {row[0] for row in db.execute("""
+            SELECT oc.recipe_key
+            FROM output_commit oc
+            JOIN tag t
+              ON t.name = oc.recipe_key
+             AND t.digest = oc.digest
+        """)}
+
+    @staticmethod
+    def _load_output_graph(db):
+        producers = {}
+        for token, key in db.execute(
+                "SELECT token, recipe_key FROM output_claim"):
+            producers[key] = token
+
+        clauses_by_key = {key: {} for key in producers}
+        rows = db.execute("""
+            SELECT c.recipe_key, w.clause_idx, w.dep_key
+            FROM output_wait w
+            JOIN output_claim c ON c.token = w.token
+        """)
+        for key, clause_idx, dep_key in rows:
+            clauses_by_key[key].setdefault(clause_idx, []).append(dep_key)
+
+        waits = {}
+        for key, clauses in clauses_by_key.items():
+            waits[key] = tuple(
+                tuple(clauses[index]) for index in sorted(clauses))
+
+        outputs = ObjectStore._current_output_keys(db)
+        return producers, waits, outputs
+
+    @staticmethod
+    def _choose_output_victim(producers, waits, outputs):
+        """Choose one deterministic deadlock victim, or return None.
+
+        The viability closure starts from coordinated outputs and every key
+        which currently has no producer.  An active producer enters the closure
+        only when every AND clause has at least one OR candidate already
+        viable.  SCCs are then built only from clauses with no viable
+        candidate.
+        """
+        viable = set(outputs)
+
+        # A key without an active producer can be newly scheduled by the
+        # caller, so it is not part of a local lock.
+        for clauses in waits.values():
+            for clause in clauses:
+                for key in clause:
+                    if key not in producers:
+                        viable.add(key)
+
+        while True:
+            changed = False
+            for producer in producers:
+                if producer in viable:
+                    continue
+                clauses = waits.get(producer, ())
+                if all(any(key in viable for key in clause)
+                       for clause in clauses):
+                    viable.add(producer)
+                    changed = True
+            if not changed:
+                break
+
+        nonviable = sorted(key for key in producers if key not in viable)
+        adjacency = {key: set() for key in nonviable}
+        for waiter in nonviable:
+            for clause in waits.get(waiter, ()):
+                if not any(key in viable for key in clause):
+                    # Such a clause cannot contain an unproduced/output key:
+                    # either would have made the clause viable.  Targets are
+                    # therefore exactly other non-viable active producers.
+                    for key in clause:
+                        if key in adjacency:
+                            adjacency[waiter].add(key)
+
+        # Kosaraju SCC.  There are at most 256 producer vertices.
+        seen = set()
+        finish_order = []
+
+        def visit(key):
+            seen.add(key)
+            for nxt in adjacency[key]:
+                if nxt not in seen:
+                    visit(nxt)
+            finish_order.append(key)
+
+        for key in nonviable:
+            if key not in seen:
+                visit(key)
+
+        reverse = {key: set() for key in nonviable}
+        for key in nonviable:
+            for nxt in adjacency[key]:
+                reverse[nxt].add(key)
+
+        component = {}
+        components = []
+
+        def assign(key, component_id):
+            component[key] = component_id
+            components[component_id].append(key)
+            for nxt in reverse[key]:
+                if nxt not in component:
+                    assign(nxt, component_id)
+
+        for key in reversed(finish_order):
+            if key not in component:
+                component_id = len(components)
+                components.append([])
+                assign(key, component_id)
+
+        sink_components = set(range(len(components)))
+        for key in nonviable:
+            key_component = component[key]
+            for nxt in adjacency[key]:
+                if component[nxt] != key_component:
+                    sink_components.discard(key_component)
+
+        candidates = []
+        for component_id in sink_components:
+            candidates.extend(components[component_id])
+        return min(candidates) if candidates else None
+
+    def _resolve_output_deadlocks(self, db):
+        """Repeatedly revoke deterministic sink-SCC victims in one DB view."""
+        producers, waits, outputs = self._load_output_graph(db)
+        released = []
+        while True:
+            victim = self._choose_output_victim(producers, waits, outputs)
+            if victim is None:
+                return tuple(released)
+            token = producers[victim]
+            db.execute("DELETE FROM output_wait WHERE token=?", (token,))
+            db.execute("DELETE FROM output_claim WHERE token=?", (token,))
+            released.append(victim)
+            producers.pop(victim, None)
+            waits.pop(victim, None)
+
+    def claim_output(self, key):
+        if not _valid_recipe_key(key):
+            raise ValueError(
+                "recipe key must be 1-48 ASCII letters, digits, '_' or '-'")
+
+        with self._serialized() as db:
+            if db.execute(
+                    "SELECT 1 FROM output_claim WHERE recipe_key=?",
+                    (key,)).fetchone() is not None:
+                return "busy", None
+
+            row = db.execute("""
+                SELECT oc.digest, b.data
+                FROM output_commit oc
+                JOIN tag t
+                  ON t.name = oc.recipe_key
+                 AND t.digest = oc.digest
+                LEFT JOIN blob b ON b.digest = oc.digest
+                WHERE oc.recipe_key = ?
+            """, (key,)).fetchone()
+            if row is not None:
+                digest, data = row
+                if data is None or \
+                        hashlib.sha256(data).hexdigest() != digest:
+                    raise CorruptBlob(digest)
+                # Coordination reads deliberately do not touch digest_use.
+                return "ready", data
+
+            active, = db.execute("SELECT COUNT(*) FROM output_claim").fetchone()
+            if active >= MAX_OUTPUT_PRODUCERS:
+                raise ValueError("too many active output producers")
+
+            seq = self._next_counter(db, "next_output_token")
+            # The persisted counter prevents reissue; random bytes keep the
+            # token opaque even to callers who know the recipe and sequence.
+            token = "oc-%x-%s" % (seq, secrets.token_hex(16))
+            db.execute(
+                "INSERT INTO output_claim(token, recipe_key, seq) "
+                "VALUES (?,?,?)", (token, key, seq))
+            return "claimed", token
+
+    def set_output_waits(self, token, groups):
+        if not isinstance(token, str):
+            raise ValueError("token must be an output-claim token string")
+        normalized = _validate_wait_groups(groups)
+
+        with self._serialized() as db:
+            row = db.execute(
+                "SELECT recipe_key FROM output_claim WHERE token=?",
+                (token,)).fetchone()
+            if row is None:
+                raise StaleOutputClaim("output claim token is no longer active")
+
+            db.execute("DELETE FROM output_wait WHERE token=?", (token,))
+            db.executemany(
+                "INSERT INTO output_wait(token, clause_idx, dep_key) "
+                "VALUES (?,?,?)",
+                [(token, clause_idx, key)
+                 for clause_idx, clause in enumerate(normalized)
+                 for key in clause])
+
+            # Replacement and all resulting victim deletions commit together.
+            return self._resolve_output_deadlocks(db)
+
+    def complete_output(self, token, data):
+        if not isinstance(token, str):
+            raise ValueError("token must be an output-claim token string")
+        if not isinstance(data, bytes) or len(data) > MAX_BLOB_SIZE:
+            raise ValueError(
+                "data must be bytes of at most %d bytes" % MAX_BLOB_SIZE)
+
+        digest = hashlib.sha256(data).hexdigest()
+        with self._serialized() as db:
+            row = db.execute(
+                "SELECT recipe_key FROM output_claim WHERE token=?",
+                (token,)).fetchone()
+            if row is None:
+                raise StaleOutputClaim("output claim token is no longer active")
+            key = row[0]
+
+            clause_rows = db.execute("""
+                SELECT clause_idx, dep_key
+                FROM output_wait
+                WHERE token=?
+                ORDER BY clause_idx
+            """, (token,)).fetchall()
+            clauses = {}
+            for clause_idx, dep_key in clause_rows:
+                clauses.setdefault(clause_idx, []).append(dep_key)
+
+            current_outputs = self._current_output_keys(db)
+            for clause_idx in sorted(clauses):
+                if not any(dep_key in current_outputs
+                           for dep_key in clauses[clause_idx]):
+                    # Rollback leaves the claim and its wait declaration in
+                    # place for a later retry with the same token.
+                    raise OutputWaiting(
+                        "wait clause %d has no coordinated output"
+                        % clause_idx)
+
+            # Content-addressed admission, matching ordinary publish().
+            db.execute("INSERT OR IGNORE INTO blob VALUES (?,?)",
+                       (digest, data))
+            stored, = db.execute(
+                "SELECT data FROM blob WHERE digest=?", (digest,)).fetchone()
+            if stored != data:
+                raise CorruptBlob(digest)
+
+            db.execute("""INSERT INTO tag VALUES (?,?)
+                          ON CONFLICT(name) DO UPDATE
+                          SET digest=excluded.digest""",
+                       (key, digest))
+
+            limit = self._capacity(db)
+            if limit is not None and self._total_bytes(db) > limit:
+                self._evict_to(db, limit, protected_digest=digest)
+
+            self._touch(db, digest)
+            db.execute("""
+                INSERT INTO output_commit(recipe_key, digest)
+                VALUES (?,?)
+                ON CONFLICT(recipe_key) DO UPDATE
+                SET digest=excluded.digest
+            """, (key, digest))
+            db.execute("DELETE FROM output_wait WHERE token=?", (token,))
+            db.execute("DELETE FROM output_claim WHERE token=?", (token,))
+            return digest
+
+    def cancel_output(self, token):
+        if not isinstance(token, str):
+            raise ValueError("token must be an output-claim token string")
+        with self._serialized() as db:
+            db.execute("DELETE FROM output_wait WHERE token=?", (token,))
+            return db.execute(
+                "DELETE FROM output_claim WHERE token=?",
+                (token,)).rowcount == 1
 
     # -- workflow planning -------------------------------------------------
 
