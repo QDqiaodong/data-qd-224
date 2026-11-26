@@ -106,6 +106,30 @@ store.describe_build(handle)             # 键也是 "A"、"B"
 
 普通 `fetch` 任一别名都会刷新整个 digest 的使用次序；该次序只按库内成功操作的先后持久化，不依赖墙钟，升级前已存在且尚未被使用的对象并列为最旧。`remove` 仍只移除标签；`collect` 返回实际删除的对象数，但只删除没有标签也没有活动检出保留的对象。
 
+## 可选共享块存储
+
+节点可以在一个**没有任何驻留整件**的新库（或已清空整件的库）上开启库内共享块模式：
+
+```python
+store.configure_shared_payload(3 << 16)
+logical_bytes, stored_bytes = store.shared_payload_usage()
+```
+
+- `configure_shared_payload(max_bytes)` 成功返回 `None`；`max_bytes` 是 `0` 到 `1 GiB` 的整数，不接受 `bool`。该设置保存在 SQLite 库内，同一路径上新建的 `ObjectStore` 实例都以库内值为准。
+- 首次开启时 `blob` 中必须没有驻留整件；否则抛 `ValueError`。这是同步元数据开启，不复制或后台迁移旧整件。模式开启后不能关闭；再次调用只调整物理块上限。若当前唯一块载荷已经大于新上限，抛 `PhysicalCapacityExceeded`（它也是 `CapacityExceeded` 的子类），不会删除块，也不会修改旧上限。
+- 从未配置过该选项的旧库仍按原格式工作；此时 `shared_payload_usage()` 返回 `(驻留整件总字节, 驻留整件总字节)`。
+
+开启后，每个整件从第 0 字节开始切成固定 `64 KiB` 的块，末块可短，空件没有块。块以块字节的 SHA-256 为标识：相同块字节在同一库的 `shared_block` 中只存一份，块序写入 `shared_block_map`，整件长度写入 `shared_artifact`；原有 `blob` 行仍用于标签、检出和外键，但 `data` 为空，不再保留第二份整件。同一个块可跨整件摘要、也可在同一整件内重复使用。整件 SHA-256、字节顺序和长度契约不变。
+
+`shared_payload_usage()` 的两个口径分别是：
+
+1. `logical_bytes`：驻留的**唯一整件摘要**的未切分长度之和，包括无标签但尚未回收的整件；这也是 `configure_capacity`、LRU、工作流预算和传输清单继续使用的大小。
+2. `stored_bytes`：`shared_block` 中实际保留的唯一块载荷字节之和；不计 SQLite 页、索引、块哈希/块序等元数据。失去最后一个 `shared_block_map` 使用者的块会在同一事务中删除，因此不会长期保留无主块或重复载荷。SQLite 文件不必缩小；已进入 freelist 的可复用页不是仍保留的块载荷。
+
+物理上限只在**原逻辑准入成功并完成原有逻辑驱逐之后**检查。也就是说，无标签优先、LRU、检出保护、一次驱逐整件并移走其全部标签、生产权/等待、传输校验和检出名额的判断顺序都不变。逻辑驱逐删除整件映射时，只有失去全部使用者的独占块才腾出物理字节；仍被其它留下整件或本次受保护清单引用的共享块不能算腾出。若原逻辑准入后的整件集合仍使 `stored_bytes` 超过共享块上限，发布、配方完成或接收安装抛 `PhysicalCapacityExceeded`，事务整体回滚，不额外挑选或驱逐新的牺牲者。失败操作不会留下新整件/块、空壳、标签变化、用序变化、保护关系、生产权消耗或完成标记。
+
+读取入口仍按原契约返回并校验完整整件：普通 `fetch`、`fetch_for_build`、`claim_output` 的 ready 读取和 `prepare_workflow` 候选校验都会按块序重组并校验整件 SHA-256；`describe_build`、工作流预算和线上帧仍使用整件原始长度，线上协议不变，对端可以继续使用未开启共享块的旧库。普通 `publish` 和 `complete_output` 遇到已损坏的共享块时不会用输入执行覆盖修复，最终整件校验失败并抛 `CorruptBlob`。唯一的修复入口仍是 `install_build`：线上帧先在无库锁阶段完整校验，最终事务还会先验证所有未传输本包的整件，然后才用已验过的传入整件 upsert 其块；因此一个验过的共享块可以同时恢复其它确实引用同一块的整件。最终物理或逻辑准入失败时，修复随事务一起回滚。
+
 ## 按接收端缺件的构建传输
 
 两个节点各用各的 SQLite 文件，互不打开对方的库；调用者负责在节点间搬运普通 Python 字典形态的清单和原始字节流。整个特性不需要网络服务、后台线程或续传协议。
@@ -139,8 +163,10 @@ python3 -B -m unittest -v
 所有测试都在临时 SQLite 文件上运行，不触碰仓库内文件。`test_output_coordination.py` 覆盖 AND-of-OR 等待、确定性 SCC 解围和旁观者保护、自环、重开后的失效令牌、完成标记与普通发布/移除/驱逐的关系、损坏 ready 制品、容量失败保留生产权、Barrier 同步的双连接领权竞争、256 生产槽与 LRU 不变；其中 Linux 验收用例先在父进程备好 80 个 1 MiB 制品和 256 个生产者及多组独立链/跨组长链，再在冷开子进程导入并打开库后按当时 `VmSize + 24 MiB` 设置 `RLIMIT_AS`，执行一次闭链等待更新和解围。`test_workflow_plan.py` 覆盖联合图优化、共享 digest 预算、标签换绑/损坏未命中、平局规则、零字节候选、不可达节点校验、并发候选恢复后的最终重算、动作 ID 检出保护、64 槽原子准入和 LRU 不变；`test_scale.py` 会建立 112 个各 1 MiB 的旧格式对象、原地升级并在 Linux 子进程的 96 MiB 地址空间限制内降到 64 MiB，然后校验留下的制品可读。`test_build_transfer.py` 覆盖缺件传输、同名标签不换绑、驱逐保护、同步点并发、截短/尾随/错 digest、坏副本修复与失败回滚；其中 Linux 规模用例在两个子进程里经 FIFO 和非 seek 的限块读写接口传输 24 个 1 MiB 制品，并以模块载入后实测虚拟内存加 16 MiB 设置地址空间上限。运行一条命令执行全部新旧回归：
 
 ```sh
-python3 -B -m unittest -v test_objects test_builds_capacity test_workflow_plan test_scale test_build_transfer test_output_coordination
+python3 -B -m unittest -v test_objects test_builds_capacity test_workflow_plan test_scale test_build_transfer test_output_coordination test_shared_payload
 ```
+
+`test_shared_payload.py` 用临时库覆盖共享块计量与库内配置、共享块上的“先逻辑淘汰、后物理准入”、失败事务状态、块内重复与回收、共享块损坏后的普通发布/配方完成拒绝修复、`install_build` 原子修复与双向旧端传输、工作流按整件长度计预算、配方令牌重试，以及 48 个 1 MiB 整件共享前 15 块时的字节数和 SQLite 已使用页上限。
 
 也可用 unittest 自动发现：
 

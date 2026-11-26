@@ -40,6 +40,8 @@ MAX_OUTPUT_PRODUCERS = 256
 MAX_WAIT_CLAUSES = 16
 MAX_CLAUSE_KEYS = 16
 TRANSFER_CHUNK = 1 << 16
+SHARED_BLOCK_SIZE = 1 << 16
+SHARED_CAPACITY_KEY = "shared_payload_capacity"
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _ACTION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,48}\Z")
 _RECIPE_KEY_RE = _ACTION_ID_RE
@@ -51,6 +53,10 @@ class CorruptBlob(Exception):
 
 class CapacityExceeded(Exception):
     pass
+
+
+class PhysicalCapacityExceeded(CapacityExceeded):
+    """The unique shared-block payload would exceed its configured limit."""
 
 
 class StaleOutputClaim(Exception):
@@ -348,6 +354,20 @@ class ObjectStore:
             CREATE TABLE IF NOT EXISTS output_commit (
                 recipe_key TEXT PRIMARY KEY,
                 digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS shared_artifact (
+                digest TEXT PRIMARY KEY
+                    REFERENCES blob(digest) ON DELETE CASCADE,
+                size INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS shared_block (
+                block_hash TEXT PRIMARY KEY,
+                data BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS shared_block_map (
+                digest TEXT NOT NULL
+                    REFERENCES blob(digest) ON DELETE CASCADE,
+                block_idx INTEGER NOT NULL,
+                block_hash TEXT NOT NULL
+                    REFERENCES shared_block(block_hash),
+                PRIMARY KEY (digest, block_idx));
             CREATE INDEX IF NOT EXISTS tag_digest ON tag(digest);
             CREATE INDEX IF NOT EXISTS build_pin_digest
                 ON build_pin(digest);
@@ -355,6 +375,8 @@ class ObjectStore:
                 ON output_wait(dep_key);
             CREATE INDEX IF NOT EXISTS output_commit_digest
                 ON output_commit(digest);
+            CREATE INDEX IF NOT EXISTS shared_block_map_hash
+                ON shared_block_map(block_hash);
         """.split(";"):
             if statement.strip():
                 db.execute(statement)
@@ -418,9 +440,193 @@ class ObjectStore:
         return None if value is None else int(value)
 
     @staticmethod
+    def _shared_capacity(db):
+        value = ObjectStore._meta_get(db, SHARED_CAPACITY_KEY)
+        return None if value is None else int(value)
+
+    @staticmethod
+    def _shared_mode(db):
+        return ObjectStore._shared_capacity(db) is not None
+
+    @staticmethod
     def _total_bytes(db):
+        if not ObjectStore._shared_mode(db):
+            return db.execute(
+                "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM blob"
+            ).fetchone()[0]
+        # Shared mode keeps blob.data empty.  Length is artifact metadata and
+        # counts every distinct whole digest, including unreclaimed ones.  The
+        # LEFT JOIN fallback only covers an externally inserted legacy row;
+        # rows created by this implementation always have metadata.
+        return db.execute("""
+            SELECT COALESCE(SUM(COALESCE(a.size, LENGTH(b.data))), 0)
+            FROM blob b
+            LEFT JOIN shared_artifact a ON a.digest = b.digest
+        """).fetchone()[0]
+
+    @staticmethod
+    def _stored_block_bytes(db):
         return db.execute(
-            "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM blob").fetchone()[0]
+            "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM shared_block"
+        ).fetchone()[0]
+
+    @staticmethod
+    def _ensure_shared_capacity(db):
+        limit = ObjectStore._shared_capacity(db)
+        if limit is None:
+            return
+        stored = int(ObjectStore._stored_block_bytes(db))
+        if stored > limit:
+            raise PhysicalCapacityExceeded(
+                "unique shared blocks use %d bytes; limit is %d"
+                % (stored, limit))
+
+    @staticmethod
+    def _blob_size(db, digest):
+        if ObjectStore._shared_mode(db):
+            row = db.execute("""
+                SELECT COALESCE(a.size, LENGTH(b.data))
+                FROM blob b
+                LEFT JOIN shared_artifact a ON a.digest=b.digest
+                WHERE b.digest=?
+            """, (digest,)).fetchone()
+            if row is None:
+                raise CorruptBlob(digest)
+            return int(row[0])
+        row = db.execute("SELECT LENGTH(data) FROM blob WHERE digest=?",
+                         (digest,)).fetchone()
+        if row is None:
+            raise CorruptBlob(digest)
+        return int(row[0])
+
+    @staticmethod
+    def _read_blob(db, digest):
+        """Return a whole artifact, or None when its blob row is absent.
+
+        In shared mode the whole byte string is assembled from ordered blocks.
+        Missing/corrupt blocks simply produce bytes that fail the caller's
+        whole-digest verification; this helper does not repair them.
+        """
+        row = db.execute("SELECT data FROM blob WHERE digest=?",
+                         (digest,)).fetchone()
+        if row is None:
+            return None
+        if not ObjectStore._shared_mode(db):
+            return row[0]
+        if row[0]:
+            # Supported shared rows use an empty blob.data.  A non-empty value
+            # here is direct whole-column damage/legacy data; expose it so the
+            # caller's whole-digest check fails rather than silently ignoring
+            # the damaged column.
+            return row[0]
+        block_rows = db.execute("""
+            SELECT b.data
+            FROM shared_block_map m
+            JOIN shared_block b ON b.block_hash = m.block_hash
+            WHERE m.digest=?
+            ORDER BY m.block_idx ASC
+        """, (digest,)).fetchall()
+        return b"".join(block_row[0] for block_row in block_rows)
+
+    @staticmethod
+    def _write_shared_blocks(db, digest, data, replace):
+        db.execute("INSERT OR IGNORE INTO blob(digest, data) VALUES (?, X'')",
+                   (digest,))
+        # Shared mode never retains a second whole-artifact copy in blob.data.
+        db.execute("UPDATE blob SET data=X'' WHERE digest=?", (digest,))
+        db.execute("""
+            INSERT INTO shared_artifact(digest, size) VALUES (?,?)
+            ON CONFLICT(digest) DO UPDATE SET size=excluded.size
+        """, (digest, len(data)))
+        if replace:
+            db.execute("DELETE FROM shared_block_map WHERE digest=?",
+                       (digest,))
+
+        for block_idx, start in enumerate(
+                range(0, len(data), SHARED_BLOCK_SIZE)):
+            block = data[start:start + SHARED_BLOCK_SIZE]
+            block_hash = hashlib.sha256(block).hexdigest()
+            if replace:
+                # A fully verified incoming whole artifact is the one allowed
+                # repair path.  Upserting also restores a shared block for
+                # every other artifact that references its content hash.
+                db.execute("""
+                    INSERT INTO shared_block(block_hash, data) VALUES (?,?)
+                    ON CONFLICT(block_hash)
+                    DO UPDATE SET data=excluded.data
+                """, (block_hash, block))
+            else:
+                existing_block = db.execute(
+                    "SELECT 1 FROM shared_block WHERE block_hash=?",
+                    (block_hash,)).fetchone()
+                if existing_block is None:
+                    # A map without its payload is pre-existing damage.  An
+                    # ordinary write must not silently fill and repair that
+                    # block; reject and roll this whole insertion back.
+                    orphan_ref = db.execute(
+                        "SELECT 1 FROM shared_block_map WHERE block_hash=? "
+                        "LIMIT 1", (block_hash,)).fetchone()
+                    if orphan_ref is not None:
+                        raise CorruptBlob(digest)
+                    db.execute(
+                        "INSERT INTO shared_block VALUES (?,?)",
+                        (block_hash, block))
+            db.execute("""
+                INSERT INTO shared_block_map(digest, block_idx, block_hash)
+                VALUES (?,?,?)
+                ON CONFLICT(digest, block_idx)
+                DO UPDATE SET block_hash=excluded.block_hash
+            """, (digest, block_idx, block_hash))
+
+        if replace:
+            ObjectStore._delete_orphan_blocks(db)
+
+    @staticmethod
+    def _put_blob_if_absent(db, digest, data):
+        """Insert a new content-addressed blob; never repair an existing one."""
+        shared = ObjectStore._shared_mode(db)
+        exists = db.execute("SELECT 1 FROM blob WHERE digest=?",
+                            (digest,)).fetchone() is not None
+        if exists:
+            return ObjectStore._read_blob(db, digest)
+        if not shared:
+            db.execute("INSERT INTO blob VALUES (?,?)", (digest, data))
+            return data
+        ObjectStore._write_shared_blocks(db, digest, data, replace=False)
+        # Read back through the shared blocks.  INSERT OR IGNORE must not
+        # overwrite a damaged block already used by another whole artifact; the
+        # mismatch makes the caller reject and roll back this publication.
+        return ObjectStore._read_blob(db, digest)
+
+    @staticmethod
+    def _delete_orphan_blocks(db):
+        db.execute("""
+            DELETE FROM shared_block
+            WHERE block_hash NOT IN (
+                SELECT block_hash FROM shared_block_map
+            )
+        """)
+
+    @staticmethod
+    def _delete_blob(db, digest):
+        """Delete one whole artifact and blocks that lost their last user."""
+        if not ObjectStore._shared_mode(db):
+            db.execute("DELETE FROM blob WHERE digest=?", (digest,))
+            return
+
+        hashes = [row[0] for row in db.execute(
+            "SELECT block_hash FROM shared_block_map WHERE digest=?",
+            (digest,)).fetchall()]
+        db.execute("DELETE FROM shared_block_map WHERE digest=?", (digest,))
+        db.execute("DELETE FROM shared_artifact WHERE digest=?", (digest,))
+        db.execute("DELETE FROM blob WHERE digest=?", (digest,))
+        for block_hash in set(hashes):
+            still_used = db.execute(
+                "SELECT 1 FROM shared_block_map WHERE block_hash=? LIMIT 1",
+                (block_hash,)).fetchone()
+            if still_used is None:
+                db.execute("DELETE FROM shared_block WHERE block_hash=?",
+                           (block_hash,))
 
     @staticmethod
     def _touch(db, digest):
@@ -441,6 +647,11 @@ class ObjectStore:
         protected = set(protected_digests)
         if protected_digest is not None:
             protected.add(protected_digest)
+        shared = ObjectStore._shared_mode(db)
+        size_select = ("COALESCE(a.size, LENGTH(b.data))" if shared
+                       else "LENGTH(b.data)")
+        size_join = (" LEFT JOIN shared_artifact a ON a.digest=b.digest"
+                     if shared else "")
         total = ObjectStore._total_bytes(db)
         if total <= limit:
             return
@@ -448,25 +659,26 @@ class ObjectStore:
         # First: objects with no tags at all, digest ascending.
         if not protected:
             untagged = db.execute("""
-                SELECT b.digest, LENGTH(b.data) FROM blob b
+                SELECT b.digest, %s FROM blob b%s
                 WHERE NOT EXISTS (SELECT 1 FROM tag t WHERE t.digest=b.digest)
                   AND NOT EXISTS (SELECT 1 FROM build_pin p
                                   WHERE p.digest=b.digest)
-                ORDER BY b.digest ASC""").fetchall()
+                ORDER BY b.digest ASC""" % (size_select, size_join)).fetchall()
         else:
             placeholders = ",".join("?" for _ in protected)
             untagged = db.execute("""
-                SELECT b.digest, LENGTH(b.data) FROM blob b
+                SELECT b.digest, %s FROM blob b%s
                 WHERE NOT EXISTS (SELECT 1 FROM tag t WHERE t.digest=b.digest)
                   AND NOT EXISTS (SELECT 1 FROM build_pin p
                                   WHERE p.digest=b.digest)
                   AND b.digest NOT IN (%s)
-                ORDER BY b.digest ASC""" % placeholders,
+                ORDER BY b.digest ASC"""
+                % (size_select, size_join, placeholders),
                 tuple(protected)).fetchall()
         for digest, size in untagged:
             if total <= limit:
                 return
-            db.execute("DELETE FROM blob WHERE digest=?", (digest,))
+            ObjectStore._delete_blob(db, digest)
             total -= size
 
         if total <= limit:
@@ -476,29 +688,31 @@ class ObjectStore:
         # an untagged-era object with no use record is oldest, ties by digest.
         if not protected:
             tagged = db.execute("""
-                SELECT b.digest, LENGTH(b.data) FROM blob b
+                SELECT b.digest, %s FROM blob b%s
                 LEFT JOIN digest_use u ON u.digest=b.digest
                 WHERE EXISTS (SELECT 1 FROM tag t WHERE t.digest=b.digest)
                   AND NOT EXISTS (SELECT 1 FROM build_pin p
                                   WHERE p.digest=b.digest)
-                ORDER BY COALESCE(u.seq, 0) ASC, b.digest ASC""").fetchall()
+                ORDER BY COALESCE(u.seq, 0) ASC, b.digest ASC"""
+                % (size_select, size_join)).fetchall()
         else:
             placeholders = ",".join("?" for _ in protected)
             tagged = db.execute("""
-                SELECT b.digest, LENGTH(b.data) FROM blob b
+                SELECT b.digest, %s FROM blob b%s
                 LEFT JOIN digest_use u ON u.digest=b.digest
                 WHERE EXISTS (SELECT 1 FROM tag t WHERE t.digest=b.digest)
                   AND NOT EXISTS (SELECT 1 FROM build_pin p
                                   WHERE p.digest=b.digest)
                   AND b.digest NOT IN (%s)
                 ORDER BY COALESCE(u.seq, 0) ASC, b.digest ASC"""
-                % placeholders, tuple(protected)).fetchall()
+                % (size_select, size_join, placeholders),
+                tuple(protected)).fetchall()
         for digest, size in tagged:
             if total <= limit:
                 return
             # Evicting a tagged object removes every alias for it at once.
             db.execute("DELETE FROM tag WHERE digest=?", (digest,))
-            db.execute("DELETE FROM blob WHERE digest=?", (digest,))
+            ObjectStore._delete_blob(db, digest)
             total -= size
 
         if total > limit:
@@ -517,6 +731,46 @@ class ObjectStore:
             self._evict_to(db, max_bytes)
         return None
 
+    def configure_shared_payload(self, max_bytes):
+        if (isinstance(max_bytes, bool)
+                or not isinstance(max_bytes, int)
+                or max_bytes < 0 or max_bytes > MAX_CAPACITY):
+            raise ValueError(
+                "shared payload limit must be an integer between 0 and 1 GiB")
+        with self._serialized() as db:
+            current = self._shared_capacity(db)
+            if current is None:
+                resident, = db.execute("SELECT COUNT(*) FROM blob").fetchone()
+                if resident:
+                    raise ValueError(
+                        "shared payload mode can only be enabled on a store "
+                        "with no resident artifacts")
+                db.execute(
+                    "INSERT INTO store_meta(key, value) VALUES (?,?)",
+                    (SHARED_CAPACITY_KEY, max_bytes))
+                return None
+
+            # Adjust an existing DB-wide setting.  If the new ceiling is too
+            # low, change nothing and delete nothing.
+            stored = int(self._stored_block_bytes(db))
+            if stored > max_bytes:
+                raise PhysicalCapacityExceeded(
+                    "stored shared blocks use %d bytes; requested limit is %d"
+                    % (stored, max_bytes))
+            db.execute("""
+                UPDATE store_meta SET value=? WHERE key=?
+            """, (max_bytes, SHARED_CAPACITY_KEY))
+        return None
+
+    def shared_payload_usage(self):
+        with self._serialized() as db:
+            logical = int(self._total_bytes(db))
+            if self._shared_capacity(db) is None:
+                stored = logical
+            else:
+                stored = int(self._stored_block_bytes(db))
+            return logical, stored
+
     # -- ordinary tag API -------------------------------------------------
 
     def publish(self, name, data):
@@ -524,10 +778,7 @@ class ObjectStore:
             raise ValueError("a non-empty tag and bytes are required")
         digest = hashlib.sha256(data).hexdigest()
         with self._serialized() as db:
-            db.execute("INSERT OR IGNORE INTO blob VALUES (?,?)",
-                       (digest, data))
-            stored, = db.execute("SELECT data FROM blob WHERE digest=?",
-                                 (digest,)).fetchone()
+            stored = self._put_blob_if_absent(db, digest, data)
             if stored != data:
                 raise CorruptBlob(digest)
             # Ordinary publication, even of the identical digest, is not a
@@ -543,18 +794,19 @@ class ObjectStore:
                 # Admission is part of this same transaction: the resulting
                 # tag ownership and resident bytes decide what may go.
                 self._evict_to(db, limit, protected_digest=digest)
+            self._ensure_shared_capacity(db)
             self._touch(db, digest)
         return digest
 
     def fetch(self, name):
         with self._serialized() as db:
-            row = db.execute("""SELECT b.digest,b.data FROM tag t
-                              JOIN blob b ON b.digest=t.digest
-                              WHERE t.name=?""", (name,)).fetchone()
+            row = db.execute("""SELECT t.digest FROM tag t
+                                WHERE t.name=?""", (name,)).fetchone()
             if row is None:
                 raise KeyError(name)
-            digest, data = row
-            if hashlib.sha256(data).hexdigest() != digest:
+            digest = row[0]
+            data = self._read_blob(db, digest)
+            if data is None or hashlib.sha256(data).hexdigest() != digest:
                 raise CorruptBlob(digest)
             self._touch(db, digest)
             return data
@@ -570,12 +822,25 @@ class ObjectStore:
 
     def collect(self):
         with self._serialized() as db:
-            return db.execute("""
-                DELETE FROM blob WHERE NOT EXISTS
+            deletable_sql = """
+                SELECT digest FROM blob WHERE NOT EXISTS
                     (SELECT 1 FROM tag WHERE tag.digest=blob.digest)
                 AND NOT EXISTS
                     (SELECT 1 FROM build_pin WHERE build_pin.digest=blob.digest)
-                """).rowcount
+            """
+            if not self._shared_mode(db):
+                return db.execute("""
+                    DELETE FROM blob WHERE NOT EXISTS
+                        (SELECT 1 FROM tag WHERE tag.digest=blob.digest)
+                    AND NOT EXISTS
+                        (SELECT 1 FROM build_pin
+                         WHERE build_pin.digest=blob.digest)
+                    """).rowcount
+
+            digests = [row[0] for row in db.execute(deletable_sql)]
+            for digest in digests:
+                self._delete_blob(db, digest)
+            return len(digests)
 
     # -- build checkout ---------------------------------------------------
 
@@ -627,11 +892,9 @@ class ObjectStore:
                                     (handle,)).fetchone()
                 raise KeyError(name if active is not None else handle)
             digest, = row
-            data_row = db.execute("SELECT data FROM blob WHERE digest=?",
-                                  (digest,)).fetchone()
-            if data_row is None:  # protected blobs must always be present
+            data = self._read_blob(db, digest)
+            if data is None:  # protected blobs must always be present
                 raise CorruptBlob(digest)
-            data, = data_row
             if hashlib.sha256(data).hexdigest() != digest:
                 raise CorruptBlob(digest)
             return data
@@ -804,16 +1067,16 @@ class ObjectStore:
                 return "busy", None
 
             row = db.execute("""
-                SELECT oc.digest, b.data
+                SELECT oc.digest
                 FROM output_commit oc
                 JOIN tag t
                   ON t.name = oc.recipe_key
                  AND t.digest = oc.digest
-                LEFT JOIN blob b ON b.digest = oc.digest
                 WHERE oc.recipe_key = ?
             """, (key,)).fetchone()
             if row is not None:
-                digest, data = row
+                digest = row[0]
+                data = self._read_blob(db, digest)
                 if data is None or \
                         hashlib.sha256(data).hexdigest() != digest:
                     raise CorruptBlob(digest)
@@ -893,10 +1156,7 @@ class ObjectStore:
                         % clause_idx)
 
             # Content-addressed admission, matching ordinary publish().
-            db.execute("INSERT OR IGNORE INTO blob VALUES (?,?)",
-                       (digest, data))
-            stored, = db.execute(
-                "SELECT data FROM blob WHERE digest=?", (digest,)).fetchone()
+            stored = self._put_blob_if_absent(db, digest, data)
             if stored != data:
                 raise CorruptBlob(digest)
 
@@ -908,6 +1168,7 @@ class ObjectStore:
             limit = self._capacity(db)
             if limit is not None and self._total_bytes(db) > limit:
                 self._evict_to(db, limit, protected_digest=digest)
+            self._ensure_shared_capacity(db)
 
             self._touch(db, digest)
             db.execute("""
@@ -945,9 +1206,8 @@ class ObjectStore:
         for node in sorted(spec["candidates"]):
             tag, expected_digest = spec["candidates"][node]
             row = db.execute("""
-                SELECT t.digest, b.data
+                SELECT t.digest
                 FROM tag t
-                LEFT JOIN blob b ON b.digest = t.digest
                 WHERE t.name = ?
             """, (tag,)).fetchone()
 
@@ -955,7 +1215,8 @@ class ObjectStore:
                 signature.append((node, None, None, None))
                 continue
 
-            bound_digest, data = row
+            bound_digest = row[0]
+            data = self._read_blob(db, bound_digest)
             if data is None:
                 actual_digest = None
                 size = None
@@ -1202,15 +1463,13 @@ class ObjectStore:
             if db.execute("SELECT 1 FROM build WHERE handle=?",
                           (handle,)).fetchone() is None:
                 raise KeyError(handle)
-            rows = db.execute("""SELECT p.name, p.digest, LENGTH(b.data)
+            rows = db.execute("""SELECT p.name, p.digest
                                  FROM build_pin p
-                                 JOIN blob b ON b.digest=p.digest
                                  WHERE p.handle=?""", (handle,)).fetchall()
             manifest = {}
-            for name, digest, size in rows:
-                if size is None:
-                    raise CorruptBlob(digest)
-                manifest[name] = (digest, int(size))
+            for name, digest in rows:
+                size = self._blob_size(db, digest)
+                manifest[name] = (digest, size)
             return manifest
 
     def transfer_needs(self, manifest):
@@ -1219,10 +1478,9 @@ class ObjectStore:
         with self._serialized() as db:
             missing = []
             for digest, size in validated.items():
-                row = db.execute("SELECT data FROM blob WHERE digest=?",
-                                 (digest,)).fetchone()
-                if row is None or len(row[0]) != size \
-                        or hashlib.sha256(row[0]).hexdigest() != digest:
+                data = self._read_blob(db, digest)
+                if data is None or len(data) != size \
+                        or hashlib.sha256(data).hexdigest() != digest:
                     missing.append(digest)
             return sorted(set(missing))
 
@@ -1260,23 +1518,15 @@ class ObjectStore:
                             "manifest digest for %r does not match the "
                             "source checkout" % name)
                 for digest in needed:
-                    if size_of[digest] == 0:
-                        # Verify the empty blob without staging a file.
-                        row = db.execute(
-                            "SELECT data FROM blob WHERE digest=?",
-                            (digest,)).fetchone()
-                        if row is None or row[0] != b"":
-                            raise CorruptBlob(digest)
-                        staged.append((digest, 0, None))
-                        continue
-                    row = db.execute("SELECT data FROM blob WHERE digest=?",
-                                     (digest,)).fetchone()
-                    if row is None:
+                    data = self._read_blob(db, digest)
+                    if data is None:
                         raise CorruptBlob(digest)
-                    data = row[0]
                     if len(data) != size_of[digest] \
                             or hashlib.sha256(data).hexdigest() != digest:
                         raise CorruptBlob(digest)
+                    if size_of[digest] == 0:
+                        staged.append((digest, 0, None))
+                        continue
                     path = os.path.join(workdir, digest)
                     with open(path, "wb") as stage:
                         for offset in range(0, len(data), TRANSFER_CHUNK):
@@ -1355,10 +1605,9 @@ class ObjectStore:
                 for digest, expected in validated.items():
                     if digest in staged:
                         continue
-                    row = db.execute("SELECT data FROM blob WHERE digest=?",
-                                     (digest,)).fetchone()
-                    if row is None or len(row[0]) != expected \
-                            or hashlib.sha256(row[0]).hexdigest() != digest:
+                    data = self._read_blob(db, digest)
+                    if data is None or len(data) != expected \
+                            or hashlib.sha256(data).hexdigest() != digest:
                         unavailable.append(digest)
                 if unavailable:
                     raise TransferBaseUnavailable(unavailable)
@@ -1374,8 +1623,12 @@ class ObjectStore:
                     if len(data) != size_of[digest] \
                             or hashlib.sha256(data).hexdigest() != digest:
                         raise CorruptBlob(digest)
-                    if db.execute("SELECT 1 FROM blob WHERE digest=?",
-                                  (digest,)).fetchone() is None:
+                    if self._shared_mode(db):
+                        self._write_shared_blocks(
+                            db, digest, data, replace=True)
+                    elif db.execute(
+                            "SELECT 1 FROM blob WHERE digest=?",
+                            (digest,)).fetchone() is None:
                         db.execute("INSERT INTO blob VALUES (?,?)",
                                    (digest, data))
                     else:
@@ -1387,6 +1640,7 @@ class ObjectStore:
                 if limit is not None and self._total_bytes(db) > limit:
                     self._evict_to(
                         db, limit, protected_digests=set(validated))
+                self._ensure_shared_capacity(db)
 
                 seq = self._next_counter(db, "next_handle")
                 handle = "%x-%s" % (seq, secrets.token_hex(16))
